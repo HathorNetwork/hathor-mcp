@@ -452,6 +452,200 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
             Ok(text)
         }
 
+        // Nano Contracts & Blueprints
+        "list_blueprints" => {
+            let resp = client
+                .get(format!("{}/v1a/nano_contract/blueprints", fullnode_url))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to list blueprints: {}", e))?;
+
+            let text = resp.text().await.unwrap_or_default();
+            Ok(text)
+        }
+
+        "get_blueprint_info" => {
+            let blueprint_id = require_str(params, "blueprint_id")?;
+
+            let resp = client
+                .get(format!(
+                    "{}/v1a/nano_contract/blueprint?id={}",
+                    fullnode_url, blueprint_id
+                ))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to get blueprint info: {}", e))?;
+
+            let text = resp.text().await.unwrap_or_default();
+            Ok(text)
+        }
+
+        "publish_blueprint" => {
+            let wallet_id = require_str(params, "wallet_id")?;
+            let code = require_str(params, "code")?;
+            let address = require_str(params, "address")?;
+
+            let resp = client
+                .post(format!(
+                    "{}/wallet/nano-contracts/create-on-chain-blueprint",
+                    wallet_headless_url
+                ))
+                .header("X-Wallet-Id", wallet_id)
+                .json(&json!({
+                    "code": code,
+                    "address": address,
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to publish blueprint: {}", e))?;
+
+            let text = resp.text().await.unwrap_or_default();
+            Ok(text)
+        }
+
+        "create_nano_contract" => {
+            let wallet_id = require_str(params, "wallet_id")?;
+            let blueprint_id = require_str(params, "blueprint_id")?;
+            let address = require_str(params, "address")?;
+            let args = params.get("args").cloned().unwrap_or(json!([]));
+            let actions = params.get("actions").cloned().unwrap_or(json!([]));
+
+            let resp = client
+                .post(format!(
+                    "{}/wallet/nano-contracts/create",
+                    wallet_headless_url
+                ))
+                .header("X-Wallet-Id", wallet_id)
+                .json(&json!({
+                    "blueprint_id": blueprint_id,
+                    "address": address,
+                    "data": {
+                        "args": args,
+                        "actions": actions,
+                    },
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to create nano contract: {}", e))?;
+
+            let text = resp.text().await.unwrap_or_default();
+            Ok(text)
+        }
+
+        "execute_nano_contract" => {
+            let wallet_id = require_str(params, "wallet_id")?;
+            let nc_id = require_str(params, "nc_id")?;
+            let method = require_str(params, "method")?;
+            let address = require_str(params, "address")?;
+            let args = params.get("args").cloned().unwrap_or(json!([]));
+            let actions = params.get("actions").cloned().unwrap_or(json!([]));
+
+            let resp = client
+                .post(format!(
+                    "{}/wallet/nano-contracts/execute",
+                    wallet_headless_url
+                ))
+                .header("X-Wallet-Id", wallet_id)
+                .json(&json!({
+                    "nc_id": nc_id,
+                    "method": method,
+                    "address": address,
+                    "data": {
+                        "args": args,
+                        "actions": actions,
+                    },
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to execute nano contract: {}", e))?;
+
+            let text = resp.text().await.unwrap_or_default();
+            Ok(text)
+        }
+
+        "get_nano_contract_state" => {
+            let nc_id = require_str(params, "nc_id")?;
+
+            let resp = client
+                .get(format!(
+                    "{}/v1a/nano_contract/state?id={}",
+                    fullnode_url, nc_id
+                ))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to get nano contract state: {}", e))?;
+
+            let text = resp.text().await.unwrap_or_default();
+            Ok(text)
+        }
+
+        "get_nano_contract_history" => {
+            let nc_id = require_str(params, "nc_id")?;
+
+            let resp = client
+                .get(format!(
+                    "{}/v1a/nano_contract/history?id={}",
+                    fullnode_url, nc_id
+                ))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to get nano contract history: {}", e))?;
+
+            let text = resp.text().await.unwrap_or_default();
+            Ok(text)
+        }
+
+        "get_nano_contract_logs" => {
+            let tx_id = require_str(params, "tx_id")?;
+
+            let resp = client
+                .get(format!(
+                    "{}/v1a/nano_contract/logs?id={}",
+                    fullnode_url, tx_id
+                ))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to get nano contract logs: {}", e))?;
+
+            let text = resp.text().await.unwrap_or_default();
+            Ok(text)
+        }
+
+        // Service URL Configuration
+        "get_service_urls" => Ok(json!({
+            "fullnode_url": fullnode_url,
+            "wallet_headless_url": wallet_headless_url,
+            "tx_mining_url": _tx_mining_url,
+        })
+        .to_string()),
+
+        "set_service_urls" => {
+            if let Some(url) = optional_str(params, "fullnode_url")? {
+                validate_url(url, "fullnode_url")?;
+                *state.fullnode_url.write().await = url.to_string();
+            }
+            if let Some(url) = optional_str(params, "wallet_headless_url")? {
+                validate_url(url, "wallet_headless_url")?;
+                *state.wallet_headless_url.write().await = url.to_string();
+            }
+            if let Some(url) = optional_str(params, "tx_mining_url")? {
+                validate_url(url, "tx_mining_url")?;
+                *state.tx_mining_url.write().await = url.to_string();
+            }
+
+            let fullnode_url = state.fullnode_url.read().await.clone();
+            let wallet_headless_url = state.wallet_headless_url.read().await.clone();
+            let tx_mining_url = state.tx_mining_url.read().await.clone();
+
+            Ok(json!({
+                "updated": true,
+                "fullnode_url": fullnode_url,
+                "wallet_headless_url": wallet_headless_url,
+                "tx_mining_url": tx_mining_url,
+            })
+            .to_string())
+        }
+
         _ => Err(format!("Unknown tool: {}", name)),
     }
 }
