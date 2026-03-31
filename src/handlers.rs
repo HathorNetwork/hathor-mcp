@@ -289,6 +289,169 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
             Ok(text)
         }
 
+        // Faucet (fullnode built-in wallet)
+        "get_faucet_balance" => {
+            let resp = client
+                .get(format!("{}/v1a/wallet/balance/", fullnode_url))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to get faucet balance: {}", e))?;
+
+            let text = resp.text().await.unwrap_or_default();
+            Ok(text)
+        }
+
+        "send_from_faucet" => {
+            let address = require_str(params, "address")?;
+            let amount = require_positive_amount(params, "amount")?;
+
+            let resp = client
+                .post(format!("{}/v1a/wallet/send_tokens/", fullnode_url))
+                .json(&json!({
+                    "data": {
+                        "inputs": [],
+                        "outputs": [{
+                            "address": address,
+                            "value": (amount * 100.0).round() as i64,
+                        }]
+                    }
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to send from faucet: {}", e))?;
+
+            let text = resp.text().await.unwrap_or_default();
+            Ok(text)
+        }
+
+        "fund_wallet" => {
+            let wallet_id = require_str(params, "wallet_id")?;
+            let amount = optional_positive_amount(params, "amount")?;
+
+            let addresses_resp = client
+                .get(format!("{}/wallet/addresses", wallet_headless_url))
+                .header("X-Wallet-Id", wallet_id)
+                .send()
+                .await
+                .map_err(|e| format!("Failed to get wallet addresses: {}", e))?;
+
+            let addresses: Value = addresses_resp
+                .json()
+                .await
+                .map_err(|_| "Failed to parse addresses")?;
+
+            let first_address = addresses
+                .get("addresses")
+                .and_then(|a| a.as_array())
+                .and_then(|a| a.first())
+                .and_then(|a| a.as_str())
+                .ok_or("Wallet has no addresses. Wait for it to sync.")?;
+
+            let balance_resp = client
+                .get(format!("{}/v1a/wallet/balance/", fullnode_url))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to get faucet balance: {}", e))?;
+
+            let balance: Value = balance_resp
+                .json()
+                .await
+                .map_err(|_| "Failed to parse faucet balance")?;
+
+            let available = balance
+                .get("balance")
+                .and_then(|b| b.get("available"))
+                .and_then(|a| a.as_i64())
+                .unwrap_or(0);
+
+            if available <= 0 {
+                return Err("Faucet has no funds. Mine some blocks first.".to_string());
+            }
+
+            let fund_amount = match amount {
+                Some(a) => (a * 100.0).round() as i64,
+                None => {
+                    let ten_percent = available / 10;
+                    ten_percent.clamp(100, 10000)
+                }
+            };
+
+            let send_resp = client
+                .post(format!("{}/v1a/wallet/send_tokens/", fullnode_url))
+                .json(&json!({
+                    "data": {
+                        "inputs": [],
+                        "outputs": [{
+                            "address": first_address,
+                            "value": fund_amount,
+                        }]
+                    }
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to send from faucet: {}", e))?;
+
+            let text = send_resp.text().await.unwrap_or_default();
+
+            Ok(format!(
+                r#"{{"funded": true, "wallet_id": "{}", "amount": {}, "result": {}}}"#,
+                wallet_id,
+                fund_amount as f64 / 100.0,
+                text
+            ))
+        }
+
+        // Blockchain
+        "get_blocks" => {
+            let count = optional_count(params, "count", 10, 100)?;
+
+            let status_resp = client
+                .get(format!("{}/v1a/status/", fullnode_url))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to get status: {}", e))?;
+
+            let status: Value = status_resp
+                .json()
+                .await
+                .map_err(|_| "Failed to parse status")?;
+
+            let height = status
+                .get("dag")
+                .and_then(|d| d.get("best_block"))
+                .and_then(|b| b.get("height"))
+                .and_then(|h| h.as_i64())
+                .unwrap_or(0) as usize;
+
+            let mut blocks = Vec::new();
+            for i in (height.saturating_sub(count)..=height).rev() {
+                if let Ok(resp) = client
+                    .get(format!("{}/v1a/block_at_height?height={}", fullnode_url, i))
+                    .send()
+                    .await
+                {
+                    if let Ok(block) = resp.json::<Value>().await {
+                        blocks.push(block);
+                    }
+                }
+            }
+
+            Ok(json!({"blocks": blocks, "currentHeight": height}).to_string())
+        }
+
+        "get_transaction" => {
+            let tx_id = require_str(params, "tx_id")?;
+
+            let resp = client
+                .get(format!("{}/v1a/transaction?id={}", fullnode_url, tx_id))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to get transaction: {}", e))?;
+
+            let text = resp.text().await.unwrap_or_default();
+            Ok(text)
+        }
+
         _ => Err(format!("Unknown tool: {}", name)),
     }
 }
