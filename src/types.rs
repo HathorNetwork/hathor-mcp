@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
+use tracing::info;
 
 // ============================================================================
 // JSON-RPC Protocol Types
@@ -57,6 +58,10 @@ pub struct McpState {
     pub wallet_headless_url: RwLock<String>,
     pub tx_mining_url: RwLock<String>,
     pub http_client: reqwest::Client,
+    /// Orchestrator URL (if using multi-tenant mode)
+    pub orchestrator_url: Option<String>,
+    /// Session ID from the orchestrator (lazily provisioned on first wallet call)
+    pub orchestrator_session: Mutex<Option<String>>,
 }
 
 impl McpState {
@@ -64,6 +69,7 @@ impl McpState {
         fullnode_url: Option<String>,
         wallet_headless_url: Option<String>,
         tx_mining_url: Option<String>,
+        orchestrator_url: Option<String>,
     ) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -83,12 +89,63 @@ impl McpState {
                 tx_mining_url.unwrap_or_else(|| "http://localhost:8002".to_string()),
             ),
             http_client,
+            orchestrator_url,
+            orchestrator_session: Mutex::new(None),
         }
     }
 
     /// Get the effective wallet-headless URL.
+    /// In orchestrator mode, this provisions a session on first call and returns
+    /// the orchestrator proxy URL. In direct mode, returns the configured URL.
     pub async fn get_headless_url(&self) -> Result<String, String> {
-        Ok(self.wallet_headless_url.read().await.clone())
+        if let Some(ref orch_url) = self.orchestrator_url {
+            let mut session = self.orchestrator_session.lock().await;
+            if let Some(ref sid) = *session {
+                return Ok(format!("{}/sessions/{}/api", orch_url, sid));
+            }
+
+            // Provision a new session
+            info!("Provisioning wallet-headless session via orchestrator");
+            let resp = self
+                .http_client
+                .post(format!("{}/sessions", orch_url))
+                .send()
+                .await
+                .map_err(|e| format!("Failed to create orchestrator session: {}", e))?;
+
+            let body: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse orchestrator response: {}", e))?;
+
+            let session_id = body
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or("Orchestrator did not return session_id")?
+                .to_string();
+
+            info!(session_id, "Orchestrator session created");
+            let url = format!("{}/sessions/{}/api", orch_url, session_id);
+            *session = Some(session_id);
+            Ok(url)
+        } else {
+            Ok(self.wallet_headless_url.read().await.clone())
+        }
+    }
+
+    /// Clean up the orchestrator session (called on shutdown).
+    pub async fn cleanup_session(&self) {
+        if let Some(ref orch_url) = self.orchestrator_url {
+            let session = self.orchestrator_session.lock().await;
+            if let Some(ref sid) = *session {
+                info!(session_id = sid, "Cleaning up orchestrator session");
+                let _ = self
+                    .http_client
+                    .delete(format!("{}/sessions/{}", orch_url, sid))
+                    .send()
+                    .await;
+            }
+        }
     }
 }
 
