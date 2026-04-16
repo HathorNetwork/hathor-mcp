@@ -1,5 +1,5 @@
 # Multi-stage build for hathor-mcp
-FROM rust:1.86-bookworm AS builder
+FROM rust:1-bookworm AS builder
 
 WORKDIR /app
 
