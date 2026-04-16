@@ -8,6 +8,17 @@ You are connected to **Hathor MCP**, an MCP server that connects to a Hathor Net
 2. Call `get_node_status` to verify connectivity.
 3. If wallet-headless is running, create wallets with `create_wallet` and fund them with `fund_wallet`.
 
+## Wallet api_key — orchestrator mode
+
+When the MCP server runs in **orchestrator mode** (the default deployment at `get-mcp.hathor.dev`), every wallet lives in its own isolated wallet-headless container. `create_wallet` provisions that container and returns an `api_key` in its response:
+
+- **You MUST store this `api_key`.** It is the handle for the wallet; without it you cannot read the balance, send transactions, or close the wallet.
+- **Pass it back on every wallet-scoped tool call** via the `api_key` parameter (`get_wallet_balance`, `get_wallet_addresses`, `send_from_wallet`, `fund_wallet`, `publish_blueprint`, `create_nano_contract`, `execute_nano_contract`, `close_wallet`, etc.).
+- **It is not recoverable.** The orchestrator does not persist it anywhere you can look up later. If you lose it, the wallet is unreachable and you'll need to `create_wallet` again (with the same seed if you want to restore the same addresses).
+- **Call `close_wallet` when done.** It tears down the container. Forgetting leaves the container running until the orchestrator's idle sweeper reaps it.
+
+Read-only fullnode tools (`get_node_status`, `get_blocks`, `get_transaction`, `list_blueprints`, `get_blueprint_info`, `get_nano_contract_state`, `get_nano_contract_history`, `get_nano_contract_logs`, `get_faucet_balance`, `send_from_faucet`) do **not** require an `api_key` — they hit the fullnode directly.
+
 ## Building dApps on Hathor
 
 ### Scaffolding a dApp
