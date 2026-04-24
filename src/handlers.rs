@@ -1,3 +1,4 @@
+use reqwest::RequestBuilder;
 use serde_json::{json, Value};
 
 use crate::types::McpState;
@@ -116,12 +117,20 @@ fn generate_seed() -> Result<String, String> {
     Ok(mnemonic.to_string())
 }
 
+/// Attach `x-api-key` to a request when we're in orchestrator mode. The
+/// orchestrator rejects unauthenticated calls with 401; in direct mode the
+/// wallet-headless container runs without auth so the header is skipped.
+fn with_api_key(req: RequestBuilder, api_key: Option<&str>) -> RequestBuilder {
+    match api_key {
+        Some(k) => req.header("x-api-key", k),
+        None => req,
+    }
+}
+
 /// Execute an MCP tool by name with the given parameters.
 pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Result<String, String> {
     let client = state.http_client.clone();
     let fullnode_url = state.fullnode_url.read().await.clone();
-    // Use orchestrator-aware URL resolution for wallet-headless
-    let wallet_headless_url = state.get_headless_url().await?;
     let _tx_mining_url = state.tx_mining_url.read().await.clone();
 
     match name {
@@ -146,27 +155,56 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
         "create_wallet" => {
             let wallet_id = require_str(params, "wallet_id")?;
             let seed = optional_str(params, "seed")?;
+            let seed_was_generated = seed.is_none();
 
             let wallet_seed = match seed {
                 Some(s) => s.to_string(),
                 None => generate_seed()?,
             };
 
-            state
-                .wallet_seeds
-                .lock()
-                .await
-                .insert(wallet_id.to_string(), wallet_seed.clone());
+            // In orchestrator mode, every create_wallet provisions a fresh
+            // wallet-headless container with its own api_key. The api_key IS
+            // the handle the caller uses to reach this wallet afterwards.
+            let (api_key_opt, wallet_headless_url) = if state.is_orchestrator_mode() {
+                let (key, url) = state.provision_session().await?;
+                (Some(key), url)
+            } else {
+                (None, state.wallet_headless_url.read().await.clone())
+            };
 
-            let resp = client
-                .post(format!("{}/start", wallet_headless_url))
-                .json(&json!({
-                    "wallet-id": wallet_id,
-                    "seed": wallet_seed,
-                }))
-                .send()
-                .await
-                .map_err(|e| format!("Failed to create wallet: {}", e))?;
+            // Seeds are only stored server-side in direct (single-tenant) mode.
+            // In orchestrator mode a shared MCP deployment can't safely hold
+            // seeds under a wallet_id keyspace — the caller owns their seed,
+            // and we surface it once inline if we generated it (see below).
+            if !state.is_orchestrator_mode() {
+                state
+                    .wallet_seeds
+                    .lock()
+                    .await
+                    .insert(wallet_id.to_string(), wallet_seed.clone());
+            }
+
+            let send_result = with_api_key(
+                client.post(format!("{}/start", wallet_headless_url)),
+                api_key_opt.as_deref(),
+            )
+            .json(&json!({
+                "wallet-id": wallet_id,
+                "seed": wallet_seed,
+            }))
+            .send()
+            .await;
+
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    // Don't leak the container we just spun up.
+                    if let Some(ref k) = api_key_opt {
+                        let _ = state.destroy_session(k).await;
+                    }
+                    return Err(format!("Failed to create wallet: {}", e));
+                }
+            };
 
             let result: Value = resp
                 .json()
@@ -176,12 +214,16 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
                 .get("success")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let is_orchestrator = api_key_opt.is_some();
             let message = if success {
-                if seed.is_some() {
-                    "Wallet created with provided seed".to_string()
-                } else {
-                    "Wallet created with generated seed (use get_wallet_seed to retrieve)"
-                        .to_string()
+                match (seed_was_generated, is_orchestrator) {
+                    (false, _) => "Wallet created with provided seed".to_string(),
+                    (true, true) => {
+                        "Wallet created with generated seed (returned inline — store it, it is NOT retrievable later)".to_string()
+                    }
+                    (true, false) => {
+                        "Wallet created with generated seed (use get_wallet_seed to retrieve)".to_string()
+                    }
                 }
             } else {
                 result
@@ -191,18 +233,54 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
                     .to_string()
             };
 
-            Ok(json!({
+            // If wallet-headless failed to start the wallet we have no use for
+            // the session we just provisioned — tear it down so containers
+            // don't leak behind a failed create.
+            if !success {
+                if let Some(ref k) = api_key_opt {
+                    let _ = state.destroy_session(k).await;
+                }
+            }
+
+            let mut response = json!({
                 "success": success,
                 "wallet_id": wallet_id,
-                "seed_stored": true,
+                "seed_stored": !is_orchestrator,
                 "message": message,
                 "details": if !success { Some(&result) } else { None }
-            })
-            .to_string())
+            });
+
+            if let Some(ref key) = api_key_opt {
+                response["api_key"] = json!(key);
+                response["api_key_notice"] = json!(
+                    "Store this api_key. You MUST include it as the `api_key` parameter on every subsequent tool call that touches this wallet. It is NOT recoverable — if you lose it, the wallet becomes unreachable and you'll need to create a new one."
+                );
+
+                // In orchestrator mode seeds are NOT persisted server-side, so if
+                // we generated one we hand it back exactly once. This is the only
+                // chance the caller has to retain it.
+                if success && seed_was_generated {
+                    response["seed"] = json!(wallet_seed);
+                    response["seed_notice"] = json!(
+                        "This seed was generated for you and is NOT stored server-side. Save it somewhere safe — it's the only way to restore this wallet."
+                    );
+                }
+            }
+
+            Ok(response.to_string())
         }
 
         "get_wallet_seed" => {
             let wallet_id = require_str(params, "wallet_id")?;
+
+            // Seeds are never stored in orchestrator mode — they were handed
+            // back inline by create_wallet. Refuse rather than returning an
+            // empty result that invites cross-tenant probing.
+            if state.is_orchestrator_mode() {
+                return Err(
+                    "Seeds are not stored server-side in orchestrator mode. The seed was returned once by create_wallet — if you didn't save it, create a new wallet.".to_string()
+                );
+            }
 
             let seeds = state.wallet_seeds.lock().await;
             match seeds.get(wallet_id) {
@@ -213,13 +291,18 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
 
         "get_wallet_status" => {
             let wallet_id = require_str(params, "wallet_id")?;
+            let api_key = optional_str(params, "api_key")?;
+            let wallet_headless_url = state.get_url_for(api_key).await?;
 
-            let resp = client
-                .get(format!("{}/wallet/status", wallet_headless_url))
-                .header("X-Wallet-Id", wallet_id)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to get wallet status: {}", e))?;
+            let resp = with_api_key(
+                client
+                    .get(format!("{}/wallet/status", wallet_headless_url))
+                    .header("X-Wallet-Id", wallet_id),
+                api_key,
+            )
+            .send()
+            .await
+            .map_err(|e| format!("Failed to get wallet status: {}", e))?;
 
             let text = resp.text().await.unwrap_or_default();
             Ok(text)
@@ -227,13 +310,18 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
 
         "get_wallet_balance" => {
             let wallet_id = require_str(params, "wallet_id")?;
+            let api_key = optional_str(params, "api_key")?;
+            let wallet_headless_url = state.get_url_for(api_key).await?;
 
-            let resp = client
-                .get(format!("{}/wallet/balance", wallet_headless_url))
-                .header("X-Wallet-Id", wallet_id)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to get wallet balance: {}", e))?;
+            let resp = with_api_key(
+                client
+                    .get(format!("{}/wallet/balance", wallet_headless_url))
+                    .header("X-Wallet-Id", wallet_id),
+                api_key,
+            )
+            .send()
+            .await
+            .map_err(|e| format!("Failed to get wallet balance: {}", e))?;
 
             let text = resp.text().await.unwrap_or_default();
             Ok(text)
@@ -241,13 +329,18 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
 
         "get_wallet_addresses" => {
             let wallet_id = require_str(params, "wallet_id")?;
+            let api_key = optional_str(params, "api_key")?;
+            let wallet_headless_url = state.get_url_for(api_key).await?;
 
-            let resp = client
-                .get(format!("{}/wallet/addresses", wallet_headless_url))
-                .header("X-Wallet-Id", wallet_id)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to get wallet addresses: {}", e))?;
+            let resp = with_api_key(
+                client
+                    .get(format!("{}/wallet/addresses", wallet_headless_url))
+                    .header("X-Wallet-Id", wallet_id),
+                api_key,
+            )
+            .send()
+            .await
+            .map_err(|e| format!("Failed to get wallet addresses: {}", e))?;
 
             let text = resp.text().await.unwrap_or_default();
             Ok(text)
@@ -257,17 +350,22 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
             let wallet_id = require_str(params, "wallet_id")?;
             let address = require_str(params, "address")?;
             let amount = require_positive_amount(params, "amount")?;
+            let api_key = optional_str(params, "api_key")?;
+            let wallet_headless_url = state.get_url_for(api_key).await?;
 
-            let resp = client
-                .post(format!("{}/wallet/simple-send-tx", wallet_headless_url))
-                .header("X-Wallet-Id", wallet_id)
-                .json(&json!({
-                    "address": address,
-                    "value": (amount * 100.0).round() as i64,
-                }))
-                .send()
-                .await
-                .map_err(|e| format!("Failed to send transaction: {}", e))?;
+            let resp = with_api_key(
+                client
+                    .post(format!("{}/wallet/simple-send-tx", wallet_headless_url))
+                    .header("X-Wallet-Id", wallet_id),
+                api_key,
+            )
+            .json(&json!({
+                "address": address,
+                "value": (amount * 100.0).round() as i64,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send transaction: {}", e))?;
 
             let text = resp.text().await.unwrap_or_default();
             Ok(text)
@@ -275,7 +373,26 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
 
         "close_wallet" => {
             let wallet_id = require_str(params, "wallet_id")?;
+            let api_key = optional_str(params, "api_key")?;
 
+            // In orchestrator mode we destroy the whole session (= container),
+            // which makes a per-wallet /wallet/stop redundant. Doing the stop
+            // anyway would be wasteful and — worse — if it failed we'd bubble
+            // out before destroy_session and leak the container.
+            if state.is_orchestrator_mode() {
+                let key = api_key.ok_or(
+                    "api_key is required in orchestrator mode — get it from create_wallet",
+                )?;
+                state.destroy_session(key).await?;
+                return Ok(json!({
+                    "success": true,
+                    "wallet_id": wallet_id,
+                    "message": "Orchestrator session destroyed. The wallet-headless container has been torn down.",
+                })
+                .to_string());
+            }
+
+            let wallet_headless_url = state.get_url_for(api_key).await?;
             let resp = client
                 .post(format!("{}/wallet/stop", wallet_headless_url))
                 .header("X-Wallet-Id", wallet_id)
@@ -283,9 +400,10 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
                 .await
                 .map_err(|e| format!("Failed to close wallet: {}", e))?;
 
+            let text = resp.text().await.unwrap_or_default();
+
             state.wallet_seeds.lock().await.remove(wallet_id);
 
-            let text = resp.text().await.unwrap_or_default();
             Ok(text)
         }
 
@@ -327,13 +445,18 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
         "fund_wallet" => {
             let wallet_id = require_str(params, "wallet_id")?;
             let amount = optional_positive_amount(params, "amount")?;
+            let api_key = optional_str(params, "api_key")?;
+            let wallet_headless_url = state.get_url_for(api_key).await?;
 
-            let addresses_resp = client
-                .get(format!("{}/wallet/addresses", wallet_headless_url))
-                .header("X-Wallet-Id", wallet_id)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to get wallet addresses: {}", e))?;
+            let addresses_resp = with_api_key(
+                client
+                    .get(format!("{}/wallet/addresses", wallet_headless_url))
+                    .header("X-Wallet-Id", wallet_id),
+                api_key,
+            )
+            .send()
+            .await
+            .map_err(|e| format!("Failed to get wallet addresses: {}", e))?;
 
             let addresses: Value = addresses_resp
                 .json()
@@ -484,20 +607,25 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
             let wallet_id = require_str(params, "wallet_id")?;
             let code = require_str(params, "code")?;
             let address = require_str(params, "address")?;
+            let api_key = optional_str(params, "api_key")?;
+            let wallet_headless_url = state.get_url_for(api_key).await?;
 
-            let resp = client
-                .post(format!(
-                    "{}/wallet/nano-contracts/create-on-chain-blueprint",
-                    wallet_headless_url
-                ))
-                .header("X-Wallet-Id", wallet_id)
-                .json(&json!({
-                    "code": code,
-                    "address": address,
-                }))
-                .send()
-                .await
-                .map_err(|e| format!("Failed to publish blueprint: {}", e))?;
+            let resp = with_api_key(
+                client
+                    .post(format!(
+                        "{}/wallet/nano-contracts/create-on-chain-blueprint",
+                        wallet_headless_url
+                    ))
+                    .header("X-Wallet-Id", wallet_id),
+                api_key,
+            )
+            .json(&json!({
+                "code": code,
+                "address": address,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to publish blueprint: {}", e))?;
 
             let text = resp.text().await.unwrap_or_default();
             Ok(text)
@@ -509,24 +637,29 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
             let address = require_str(params, "address")?;
             let args = params.get("args").cloned().unwrap_or(json!([]));
             let actions = params.get("actions").cloned().unwrap_or(json!([]));
+            let api_key = optional_str(params, "api_key")?;
+            let wallet_headless_url = state.get_url_for(api_key).await?;
 
-            let resp = client
-                .post(format!(
-                    "{}/wallet/nano-contracts/create",
-                    wallet_headless_url
-                ))
-                .header("X-Wallet-Id", wallet_id)
-                .json(&json!({
-                    "blueprint_id": blueprint_id,
-                    "address": address,
-                    "data": {
-                        "args": args,
-                        "actions": actions,
-                    },
-                }))
-                .send()
-                .await
-                .map_err(|e| format!("Failed to create nano contract: {}", e))?;
+            let resp = with_api_key(
+                client
+                    .post(format!(
+                        "{}/wallet/nano-contracts/create",
+                        wallet_headless_url
+                    ))
+                    .header("X-Wallet-Id", wallet_id),
+                api_key,
+            )
+            .json(&json!({
+                "blueprint_id": blueprint_id,
+                "address": address,
+                "data": {
+                    "args": args,
+                    "actions": actions,
+                },
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to create nano contract: {}", e))?;
 
             let text = resp.text().await.unwrap_or_default();
             Ok(text)
@@ -539,25 +672,30 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
             let address = require_str(params, "address")?;
             let args = params.get("args").cloned().unwrap_or(json!([]));
             let actions = params.get("actions").cloned().unwrap_or(json!([]));
+            let api_key = optional_str(params, "api_key")?;
+            let wallet_headless_url = state.get_url_for(api_key).await?;
 
-            let resp = client
-                .post(format!(
-                    "{}/wallet/nano-contracts/execute",
-                    wallet_headless_url
-                ))
-                .header("X-Wallet-Id", wallet_id)
-                .json(&json!({
-                    "nc_id": nc_id,
-                    "method": method,
-                    "address": address,
-                    "data": {
-                        "args": args,
-                        "actions": actions,
-                    },
-                }))
-                .send()
-                .await
-                .map_err(|e| format!("Failed to execute nano contract: {}", e))?;
+            let resp = with_api_key(
+                client
+                    .post(format!(
+                        "{}/wallet/nano-contracts/execute",
+                        wallet_headless_url
+                    ))
+                    .header("X-Wallet-Id", wallet_id),
+                api_key,
+            )
+            .json(&json!({
+                "nc_id": nc_id,
+                "method": method,
+                "address": address,
+                "data": {
+                    "args": args,
+                    "actions": actions,
+                },
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to execute nano contract: {}", e))?;
 
             let text = resp.text().await.unwrap_or_default();
             Ok(text)
@@ -612,12 +750,28 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
         }
 
         // Service URL Configuration
-        "get_service_urls" => Ok(json!({
-            "fullnode_url": fullnode_url,
-            "wallet_headless_url": wallet_headless_url,
-            "tx_mining_url": _tx_mining_url,
-        })
-        .to_string()),
+        "get_service_urls" => {
+            // In orchestrator mode, wallet-headless URLs are per-session and
+            // handed out by `create_wallet` — there's no single URL to report.
+            let wallet_headless_url = if state.is_orchestrator_mode() {
+                Value::Null
+            } else {
+                Value::String(state.wallet_headless_url.read().await.clone())
+            };
+            let orchestrator_url = state
+                .orchestrator_url
+                .as_ref()
+                .map(|s| Value::String(s.clone()))
+                .unwrap_or(Value::Null);
+
+            Ok(json!({
+                "fullnode_url": fullnode_url,
+                "wallet_headless_url": wallet_headless_url,
+                "orchestrator_url": orchestrator_url,
+                "tx_mining_url": _tx_mining_url,
+            })
+            .to_string())
+        }
 
         "set_service_urls" => {
             if let Some(url) = optional_str(params, "fullnode_url")? {

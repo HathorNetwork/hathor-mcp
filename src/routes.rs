@@ -60,7 +60,7 @@ pub async fn dispatch(state: &McpSharedState, request: JsonRpcRequest) -> JsonRp
             jsonrpc: "2.0".to_string(),
             id: request.id,
             result: Some(json!({
-                "tools": get_tools()
+                "tools": get_tools(state.is_orchestrator_mode())
             })),
             error: None,
         },
