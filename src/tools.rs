@@ -54,9 +54,12 @@ pub fn get_tools(is_orchestrator: bool) -> Vec<McpTool> {
 it. Returns an `api_key` — YOU MUST STORE IT and pass it back via the `api_key` parameter on \
 every subsequent tool call that touches this wallet (get_wallet_balance, send_from_wallet, \
 close_wallet, etc). The api_key is not recoverable; losing it means the wallet becomes \
-unreachable and you'll need to create a new one. Generates a BIP39 seed if none is provided."
+unreachable and you'll need to create a new one. Generates a BIP39 seed if none is provided \
+— if generated, the seed is returned inline exactly once and is NOT stored server-side."
     } else {
-        "Create a new wallet via the wallet-headless service. Generates a seed if not provided."
+        "Create a new wallet via the wallet-headless service. Generates a BIP39 seed if none \
+is provided — if generated, the seed is returned inline exactly once and is NOT stored \
+server-side, so save it immediately."
     };
 
     vec![
@@ -93,20 +96,6 @@ unreachable and you'll need to create a new one. Generates a BIP39 seed if none 
                     "seed": {
                         "type": "string",
                         "description": "24-word BIP39 seed phrase (generated if not provided)"
-                    }
-                },
-                "required": ["wallet_id"]
-            }),
-        },
-        McpTool {
-            name: "get_wallet_seed".to_string(),
-            description: "Retrieve the seed phrase for a wallet created in this session.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "wallet_id": {
-                        "type": "string",
-                        "description": "The wallet ID"
                     }
                 },
                 "required": ["wallet_id"]
@@ -450,28 +439,6 @@ unreachable and you'll need to create a new one. Generates a BIP39 seed if none 
             input_schema: json!({
                 "type": "object",
                 "properties": {},
-                "required": []
-            }),
-        },
-        McpTool {
-            name: "set_service_urls".to_string(),
-            description: "Update service endpoint URLs at runtime. Only provided URLs are changed.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "fullnode_url": {
-                        "type": "string",
-                        "description": "Fullnode API URL (e.g. http://127.0.0.1:8080)"
-                    },
-                    "wallet_headless_url": {
-                        "type": "string",
-                        "description": "Wallet-headless service URL (e.g. http://localhost:8001)"
-                    },
-                    "tx_mining_url": {
-                        "type": "string",
-                        "description": "Tx-mining service URL (e.g. http://localhost:8002)"
-                    }
-                },
                 "required": []
             }),
         },

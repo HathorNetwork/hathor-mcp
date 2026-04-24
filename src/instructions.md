@@ -8,6 +8,10 @@ You are connected to **Hathor MCP**, an MCP server that connects to a Hathor Net
 2. Call `get_node_status` to verify connectivity.
 3. If wallet-headless is running, create wallets with `create_wallet` and fund them with `fund_wallet`.
 
+## Seed handling
+
+`create_wallet` never stores seeds server-side. If you let it generate one (by omitting the `seed` parameter), the 24-word BIP39 phrase is included in its response exactly once under the `seed` field. **Save it immediately** — the MCP server has no way to return it to you later, and losing it means you can't restore the wallet.
+
 ## Wallet api_key — orchestrator mode
 
 When the MCP server runs in **orchestrator mode** (the default deployment at `get-mcp.hathor.dev`), every wallet lives in its own isolated wallet-headless container. `create_wallet` provisions that container and returns an `api_key` in its response:
@@ -67,4 +71,4 @@ Key concepts (brief — the skill has full details):
 - All amounts are in HTR (not cents). The MCP server handles conversion.
 - The faucet is the fullnode's built-in wallet — only available if the fullnode was started with `--wallet`.
 - Wallet `statusCode` 3 means "Ready" — wait for this after creating a wallet.
-- Use `set_service_urls` to point at different fullnode/wallet-headless instances at runtime.
+- Service endpoint URLs are fixed at startup (via CLI flags or environment). Use `get_service_urls` to inspect them; there is no runtime setter.

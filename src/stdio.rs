@@ -1,4 +1,5 @@
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tracing::warn;
 
 use crate::routes::dispatch;
 use crate::types::{JsonRpcRequest, McpSharedState};
@@ -27,10 +28,7 @@ pub async fn run_stdio(state: McpSharedState) {
                         "message": format!("Parse error: {}", e)
                     }
                 });
-                let _ = stdout
-                    .write_all(format!("{}\n", error_response).as_bytes())
-                    .await;
-                let _ = stdout.flush().await;
+                write_line(&mut stdout, &error_response.to_string()).await;
                 continue;
             }
         };
@@ -42,9 +40,19 @@ pub async fn run_stdio(state: McpSharedState) {
 
         let response = dispatch(&state, request).await;
 
-        if let Ok(json) = serde_json::to_string(&response) {
-            let _ = stdout.write_all(format!("{}\n", json).as_bytes()).await;
-            let _ = stdout.flush().await;
+        match serde_json::to_string(&response) {
+            Ok(json) => write_line(&mut stdout, &json).await,
+            Err(e) => warn!(error = %e, "Failed to serialize JSON-RPC response"),
         }
+    }
+}
+
+async fn write_line(stdout: &mut io::Stdout, payload: &str) {
+    if let Err(e) = stdout.write_all(format!("{}\n", payload).as_bytes()).await {
+        warn!(error = %e, "Failed to write JSON-RPC response to stdout");
+        return;
+    }
+    if let Err(e) = stdout.flush().await {
+        warn!(error = %e, "Failed to flush stdout after JSON-RPC response");
     }
 }
