@@ -62,6 +62,9 @@ struct Args {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
+        // Keep logs off stdout: in --stdio mode stdout carries JSON-RPC
+        // protocol traffic and any log line there would break the client.
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "hathor_mcp=info".into()),

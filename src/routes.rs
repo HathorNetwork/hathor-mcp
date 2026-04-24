@@ -55,12 +55,11 @@ async fn require_bearer_auth(
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    // Fold any length mismatch into the accumulator so we don't short-circuit
+    // on length — which would leak the token length through response timing.
+    let mut diff: usize = a.len() ^ b.len();
+    for i in 0..a.len().min(b.len()) {
+        diff |= (a[i] ^ b[i]) as usize;
     }
     diff == 0
 }
