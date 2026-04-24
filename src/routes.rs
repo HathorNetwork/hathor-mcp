@@ -1,26 +1,67 @@
 use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{sse::Event, IntoResponse, Sse},
+    body::Body,
+    extract::{Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
 };
 use futures_util::stream::{self, Stream};
 use serde_json::json;
-use std::{convert::Infallible, time::Duration};
-use tower_http::cors::CorsLayer;
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use crate::handlers::execute_tool;
 use crate::tools::get_tools;
 use crate::types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpSharedState};
 
-pub fn create_router(state: McpSharedState) -> Router {
-    Router::new()
+pub fn create_router(state: McpSharedState, auth_token: Option<String>) -> Router {
+    let mcp_routes = Router::new()
         .route("/mcp", post(handle_mcp_request))
-        .route("/mcp/sse", get(handle_sse))
+        .route("/mcp/sse", get(handle_sse));
+
+    let mcp_routes = match auth_token {
+        Some(token) => mcp_routes.layer(middleware::from_fn_with_state(
+            Arc::new(token),
+            require_bearer_auth,
+        )),
+        None => mcp_routes,
+    };
+
+    Router::new()
+        .merge(mcp_routes)
         .route("/health", get(handle_health))
-        .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// Bearer-token gate on /mcp and /mcp/sse. The token is compared in constant
+/// time to avoid leaking its length or prefix through response-time timing.
+async fn require_bearer_auth(
+    State(expected): State<Arc<String>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::trim);
+
+    match presented {
+        Some(t) if ct_eq(t.as_bytes(), expected.as_bytes()) => next.run(req).await,
+        _ => (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+    }
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    // Fold any length mismatch into the accumulator so we don't short-circuit
+    // on length — which would leak the token length through response timing.
+    let mut diff: usize = a.len() ^ b.len();
+    for i in 0..a.len().min(b.len()) {
+        diff |= (a[i] ^ b[i]) as usize;
+    }
+    diff == 0
 }
 
 pub async fn handle_mcp_request(

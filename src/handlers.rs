@@ -1,5 +1,6 @@
 use reqwest::RequestBuilder;
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::types::McpState;
 
@@ -98,16 +99,6 @@ fn optional_count(
     }
 }
 
-fn validate_url(url: &str, field: &str) -> Result<(), String> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(format!(
-            "'{}' must be a valid URL starting with http:// or https://, got '{}'",
-            field, url
-        ));
-    }
-    Ok(())
-}
-
 /// Generate a 24-word BIP39 seed phrase.
 fn generate_seed() -> Result<String, String> {
     let mut entropy = [0u8; 32]; // 256 bits = 24 words
@@ -172,18 +163,6 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
                 (None, state.wallet_headless_url.read().await.clone())
             };
 
-            // Seeds are only stored server-side in direct (single-tenant) mode.
-            // In orchestrator mode a shared MCP deployment can't safely hold
-            // seeds under a wallet_id keyspace — the caller owns their seed,
-            // and we surface it once inline if we generated it (see below).
-            if !state.is_orchestrator_mode() {
-                state
-                    .wallet_seeds
-                    .lock()
-                    .await
-                    .insert(wallet_id.to_string(), wallet_seed.clone());
-            }
-
             let send_result = with_api_key(
                 client.post(format!("{}/start", wallet_headless_url)),
                 api_key_opt.as_deref(),
@@ -200,7 +179,9 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
                 Err(e) => {
                     // Don't leak the container we just spun up.
                     if let Some(ref k) = api_key_opt {
-                        let _ = state.destroy_session(k).await;
+                        if let Err(cleanup_err) = state.destroy_session(k).await {
+                            warn!(error = %cleanup_err, "destroy_session failed after create_wallet network error");
+                        }
                     }
                     return Err(format!("Failed to create wallet: {}", e));
                 }
@@ -214,16 +195,11 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
                 .get("success")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let is_orchestrator = api_key_opt.is_some();
             let message = if success {
-                match (seed_was_generated, is_orchestrator) {
-                    (false, _) => "Wallet created with provided seed".to_string(),
-                    (true, true) => {
-                        "Wallet created with generated seed (returned inline — store it, it is NOT retrievable later)".to_string()
-                    }
-                    (true, false) => {
-                        "Wallet created with generated seed (use get_wallet_seed to retrieve)".to_string()
-                    }
+                if seed_was_generated {
+                    "Wallet created with generated seed (returned inline — store it, it is NOT retrievable later)".to_string()
+                } else {
+                    "Wallet created with provided seed".to_string()
                 }
             } else {
                 result
@@ -238,55 +214,38 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
             // don't leak behind a failed create.
             if !success {
                 if let Some(ref k) = api_key_opt {
-                    let _ = state.destroy_session(k).await;
+                    if let Err(cleanup_err) = state.destroy_session(k).await {
+                        warn!(error = %cleanup_err, "destroy_session failed after create_wallet returned success:false");
+                    }
                 }
             }
 
             let mut response = json!({
                 "success": success,
                 "wallet_id": wallet_id,
-                "seed_stored": !is_orchestrator,
+                "seed_stored": false,
                 "message": message,
                 "details": if !success { Some(&result) } else { None }
             });
+
+            // Seeds are never stored server-side (in either mode). If we
+            // generated a seed, surface it once so the caller can retain it —
+            // for caller-provided seeds they already have it.
+            if success && seed_was_generated {
+                response["seed"] = json!(wallet_seed);
+                response["seed_notice"] = json!(
+                    "This seed was generated for you and is NOT stored server-side. Save it somewhere safe — it's the only way to restore this wallet."
+                );
+            }
 
             if let Some(ref key) = api_key_opt {
                 response["api_key"] = json!(key);
                 response["api_key_notice"] = json!(
                     "Store this api_key. You MUST include it as the `api_key` parameter on every subsequent tool call that touches this wallet. It is NOT recoverable — if you lose it, the wallet becomes unreachable and you'll need to create a new one."
                 );
-
-                // In orchestrator mode seeds are NOT persisted server-side, so if
-                // we generated one we hand it back exactly once. This is the only
-                // chance the caller has to retain it.
-                if success && seed_was_generated {
-                    response["seed"] = json!(wallet_seed);
-                    response["seed_notice"] = json!(
-                        "This seed was generated for you and is NOT stored server-side. Save it somewhere safe — it's the only way to restore this wallet."
-                    );
-                }
             }
 
             Ok(response.to_string())
-        }
-
-        "get_wallet_seed" => {
-            let wallet_id = require_str(params, "wallet_id")?;
-
-            // Seeds are never stored in orchestrator mode — they were handed
-            // back inline by create_wallet. Refuse rather than returning an
-            // empty result that invites cross-tenant probing.
-            if state.is_orchestrator_mode() {
-                return Err(
-                    "Seeds are not stored server-side in orchestrator mode. The seed was returned once by create_wallet — if you didn't save it, create a new wallet.".to_string()
-                );
-            }
-
-            let seeds = state.wallet_seeds.lock().await;
-            match seeds.get(wallet_id) {
-                Some(seed) => Ok(json!({"wallet_id": wallet_id, "seed": seed}).to_string()),
-                None => Ok(json!({"error": "Seed not found. Only seeds from wallets created in this session are stored."}).to_string()),
-            }
         }
 
         "get_wallet_status" => {
@@ -401,9 +360,6 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
                 .map_err(|e| format!("Failed to close wallet: {}", e))?;
 
             let text = resp.text().await.unwrap_or_default();
-
-            state.wallet_seeds.lock().await.remove(wallet_id);
-
             Ok(text)
         }
 
@@ -769,33 +725,6 @@ pub async fn execute_tool(state: &McpState, name: &str, params: &Value) -> Resul
                 "wallet_headless_url": wallet_headless_url,
                 "orchestrator_url": orchestrator_url,
                 "tx_mining_url": _tx_mining_url,
-            })
-            .to_string())
-        }
-
-        "set_service_urls" => {
-            if let Some(url) = optional_str(params, "fullnode_url")? {
-                validate_url(url, "fullnode_url")?;
-                *state.fullnode_url.write().await = url.to_string();
-            }
-            if let Some(url) = optional_str(params, "wallet_headless_url")? {
-                validate_url(url, "wallet_headless_url")?;
-                *state.wallet_headless_url.write().await = url.to_string();
-            }
-            if let Some(url) = optional_str(params, "tx_mining_url")? {
-                validate_url(url, "tx_mining_url")?;
-                *state.tx_mining_url.write().await = url.to_string();
-            }
-
-            let fullnode_url = state.fullnode_url.read().await.clone();
-            let wallet_headless_url = state.wallet_headless_url.read().await.clone();
-            let tx_mining_url = state.tx_mining_url.read().await.clone();
-
-            Ok(json!({
-                "updated": true,
-                "fullnode_url": fullnode_url,
-                "wallet_headless_url": wallet_headless_url,
-                "tx_mining_url": tx_mining_url,
             })
             .to_string())
         }

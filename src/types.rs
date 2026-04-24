@@ -53,7 +53,6 @@ pub struct McpTool {
 // ============================================================================
 
 pub struct McpState {
-    pub wallet_seeds: Mutex<HashMap<String, String>>,
     pub fullnode_url: RwLock<String>,
     pub wallet_headless_url: RwLock<String>,
     pub tx_mining_url: RwLock<String>,
@@ -82,7 +81,6 @@ impl McpState {
             .expect("Failed to build HTTP client");
 
         Self {
-            wallet_seeds: Mutex::new(HashMap::new()),
             fullnode_url: RwLock::new(
                 fullnode_url.unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),
             ),

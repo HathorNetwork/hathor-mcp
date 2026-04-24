@@ -32,11 +32,27 @@ cargo build --release
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--bind` | 127.0.0.1 | HTTP listen address. Use `0.0.0.0` only when you mean to expose the port |
 | `--port` | 9876 | HTTP server port |
 | `--fullnode-url` | http://127.0.0.1:8080 | Hathor fullnode API URL |
 | `--wallet-headless-url` | http://localhost:8001 | Wallet-headless service URL |
 | `--tx-mining-url` | http://localhost:8002 | Tx-mining service URL |
+| `--orchestrator-url` | (unset) | Headless orchestrator URL for multi-tenant mode |
+| `--auth-token` | (generated) | Bearer token clients must present; also reads `HATHOR_MCP_TOKEN`. Auto-generated to stderr if unset |
+| `--no-auth` | false | Disable bearer auth on /mcp (loopback only) |
 | `--stdio` | false | Use stdio transport instead of HTTP |
+
+## Authentication
+
+HTTP mode requires a bearer token on every `/mcp` and `/mcp/sse` request:
+
+```
+Authorization: Bearer <token>
+```
+
+If `--auth-token` and `HATHOR_MCP_TOKEN` are both unset, a random 32-byte token is generated at startup and printed to stderr. Set `HATHOR_MCP_TOKEN` (or `--auth-token`) to reuse a fixed value across restarts. Use `--no-auth` only on a loopback bind when you're sure no other process can reach the port.
+
+The `/health` endpoint is unauthenticated so container orchestrators can health-check it.
 
 ## MCP Configuration
 
@@ -75,10 +91,9 @@ cargo build --release
 
 ### Wallet Operations
 - `generate_seed` — Generate BIP39 seed phrase
-- `create_wallet` / `close_wallet` — Manage wallets
+- `create_wallet` / `close_wallet` — Manage wallets. Generated seeds are returned inline in `create_wallet`'s response and are never stored server-side
 - `get_wallet_status` / `get_wallet_balance` / `get_wallet_addresses`
 - `send_from_wallet` — Send HTR
-- `get_wallet_seed` — Retrieve seed (session-scoped)
 
 ### Faucet
 - `get_faucet_balance` — Fullnode wallet balance
@@ -93,7 +108,7 @@ cargo build --release
 - `get_nano_contract_state` / `get_nano_contract_history` / `get_nano_contract_logs`
 
 ### Configuration
-- `get_service_urls` / `set_service_urls` — Runtime URL configuration
+- `get_service_urls` — Inspect configured endpoint URLs (URLs are fixed at startup)
 
 ## License
 
